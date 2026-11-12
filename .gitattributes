@@ -1,0 +1,7 @@
+# 所有文本文件统一 LF（VM 是 Linux，CRLF 会让 .sh 无法执行）
+* text=auto eol=lf
+*.sh text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
