@@ -159,6 +159,41 @@ static void TestCRC() {
         std::string b = "abcdefgX";
         CHECK(crc32c::Value(a.data(), a.size()) != crc32c::Value(b.data(), b.size()));
     }
+
+    // 【差分测试】查表版 vs 逐位版：随机数据上必须完全一致
+    // 这是最有价值的一个测试 —— 两种独立实现互相验证
+    {
+        uint32_t seed = 12345;
+        auto next_rand = [&seed]() {
+            seed = seed * 1103515245u + 12345u;
+            return static_cast<unsigned char>((seed >> 16) & 0xff);
+        };
+
+        int mismatch = 0;
+        for (int round = 0; round < 200; round++) {
+            int len = 1 + (round % 64);          // 1..64 字节
+            std::string buf(len, '\0');
+            for (int i = 0; i < len; i++) buf[i] = static_cast<char>(next_rand());
+
+            uint32_t fast = crc32c::Value(buf.data(), buf.size());
+            uint32_t slow = crc32c::ExtendBitwise(0, buf.data(), buf.size());
+            if (fast != slow) mismatch++;
+        }
+        CHECK(mismatch == 0);   // 200 组随机数据，0 处不一致
+    }
+
+    // 分段 Extend 与逐位版也必须一致
+    {
+        const char* s = "leveldb-mini crc32c differential test";
+        size_t n = strlen(s);
+        uint32_t whole = crc32c::ExtendBitwise(0, s, n);
+        uint32_t part = 0;
+        for (size_t i = 0; i < n; i += 7) {
+            size_t chunk = (n - i < 7) ? (n - i) : 7;
+            part = crc32c::Extend(part, s + i, chunk);
+        }
+        CHECK(whole == part);
+    }
 }
 
 // ---------------- Slice ----------------

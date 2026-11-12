@@ -10,14 +10,15 @@
 //   写到一半断电会留下「半条记录」。
 //   没有 CRC -> 读的时候把半条当完整的 -> 数据错乱。
 //   有 CRC   -> 校验失败 -> 知道这条不完整 -> 停在这里。
-//
-// 实现：查表法（256 项），一次处理 1 字节。
 namespace crc32c {
 
-// data 的 CRC，extend 支持「接着上一段算」（WAL 分片写时有用）
+// 【生产用】查表版：一次处理 1 字节，比逐位版快约 8 倍
 uint32_t Extend(uint32_t init_crc, const char* data, size_t n);
 
 inline uint32_t Value(const char* data, size_t n) { return Extend(0, data, n); }
+
+// 【仅用于测试】逐位版：逻辑清晰但慢，用来验证查表版的结果正确
+uint32_t ExtendBitwise(uint32_t init_crc, const char* data, size_t n);
 
 }  // namespace crc32c
 
