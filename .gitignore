@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.exe
+*.sst
+*.log
+*.tar
+compile_commands.json
+db_test_dir/
+.tmp/
