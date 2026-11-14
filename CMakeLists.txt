@@ -15,18 +15,22 @@ add_library(ldb
   src/util/coding.cpp
   src/util/crc32c.cpp
   src/wal.cpp
+  src/skiplist.cpp
+  src/memtable.cpp
 )
 
 target_include_directories(ldb PUBLIC include src)
 
-# 工具层测试
 add_executable(test_util tests/test_util.cpp)
 target_link_libraries(test_util ldb)
 
-# WAL 测试
 add_executable(test_wal tests/test_wal.cpp)
 target_link_libraries(test_wal ldb)
+
+add_executable(test_memtable tests/test_memtable.cpp)
+target_link_libraries(test_memtable ldb)
 
 enable_testing()
 add_test(NAME util COMMAND test_util)
 add_test(NAME wal COMMAND test_wal)
+add_test(NAME memtable COMMAND test_memtable)
