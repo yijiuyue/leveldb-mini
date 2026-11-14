@@ -17,20 +17,18 @@ add_library(ldb
   src/wal.cpp
   src/skiplist.cpp
   src/memtable.cpp
+  src/block.cpp
 )
 
 target_include_directories(ldb PUBLIC include src)
 
-add_executable(test_util tests/test_util.cpp)
-target_link_libraries(test_util ldb)
-
-add_executable(test_wal tests/test_wal.cpp)
-target_link_libraries(test_wal ldb)
-
-add_executable(test_memtable tests/test_memtable.cpp)
-target_link_libraries(test_memtable ldb)
+foreach(t util wal memtable block)
+  add_executable(test_${t} tests/test_${t}.cpp)
+  target_link_libraries(test_${t} ldb)
+endforeach()
 
 enable_testing()
 add_test(NAME util COMMAND test_util)
 add_test(NAME wal COMMAND test_wal)
 add_test(NAME memtable COMMAND test_memtable)
+add_test(NAME block COMMAND test_block)
