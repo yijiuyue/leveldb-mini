@@ -1,0 +1,251 @@
+#include "table.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+
+#include "util/coding.h"
+
+namespace ldb {
+
+namespace {
+
+// magic：校验「这个文件确实是我的 SSTable」
+const char kMagic[8] = {'l', 'e', 'v', 'e', 'l', 'd', 'b', ':'};
+constexpr size_t kFooterSize = 40;  // 4 × 8 偏移 + 8 magic
+
+std::string ErrnoMsg(const char* what) {
+    return std::string(what) + ": " + std::strerror(errno);
+}
+
+}  // namespace
+
+// ================= TableBuilder =================
+
+TableBuilder::TableBuilder(const std::string& path, size_t block_size)
+    : path_(path), block_size_(block_size) {
+    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_ < 0) {
+        status_ = Status::IOError(ErrnoMsg(("open " + path).c_str()));
+    }
+}
+
+TableBuilder::~TableBuilder() {
+    if (fd_ >= 0) {
+        if (!finished_) {
+            // 没调用 Finish 就析构：数据不完整，丢弃（不 fsync）
+            // 调用方应该检查 Finish 的返回值
+        }
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
+Status TableBuilder::WriteRaw(const char* data, size_t n) {
+    size_t written = 0;
+    while (written < n) {
+        ssize_t r = ::write(fd_, data + written, n - written);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return Status::IOError(ErrnoMsg("write"));
+        }
+        written += static_cast<size_t>(r);
+    }
+    offset_ += n;
+    return Status::OK();
+}
+
+Status TableBuilder::Add(const Slice& key, const Slice& value) {
+    if (!status_.ok()) return status_;
+    if (finished_) return Status::InvalidArgument("Add after Finish");
+
+    // key 必须严格递增
+    if (has_last_key_ && key.Compare(Slice(last_key_)) <= 0) {
+        return Status::InvalidArgument("keys must be added in increasing order");
+    }
+    last_key_.assign(key.data(), key.size());
+    has_last_key_ = true;
+
+    data_block_.Add(key, value);
+    pending_index_key_ = last_key_;
+    num_entries_++;
+
+    // block 攒到 4KB 就落盘
+    if (data_block_.CurrentSizeEstimate() >= block_size_) {
+        return Flush();
+    }
+    return Status::OK();
+}
+
+Status TableBuilder::Flush() {
+    if (data_block_.empty()) return Status::OK();
+
+    const uint64_t block_offset = offset_;
+    Slice contents = data_block_.Finish();
+    const uint32_t block_size = static_cast<uint32_t>(contents.size());
+
+    Status s = WriteRaw(contents.data(), contents.size());
+    if (!s.ok()) return s;
+
+    // index 加一条：key = 本 block 的最后一个 key
+    //               value = (block_offset, block_size)
+    std::string handle;
+    PutVarint32(&handle, static_cast<uint32_t>(block_offset));
+    PutVarint32(&handle, block_size);
+    index_block_.Add(Slice(pending_index_key_), Slice(handle));
+
+    data_block_.Reset();
+    num_data_blocks_++;
+    return Status::OK();
+}
+
+Status TableBuilder::Finish() {
+    if (!status_.ok()) return status_;
+    if (finished_) return Status::OK();
+
+    // ① 最后一批 data block
+    Status s = Flush();
+    if (!s.ok()) return s;
+
+    // ② index block
+    Slice index_contents = index_block_.Finish();
+    const uint64_t index_offset = offset_;
+    const uint64_t index_size = index_contents.size();
+    s = WriteRaw(index_contents.data(), index_contents.size());
+    if (!s.ok()) return s;
+
+    // ③ footer（40 字节）
+    std::string footer;
+    PutFixed64(&footer, 0);            // filter_offset（布隆后面做，先填 0）
+    PutFixed64(&footer, 0);            // filter_size
+    PutFixed64(&footer, index_offset);
+    PutFixed64(&footer, index_size);
+    footer.append(kMagic, sizeof(kMagic));
+    // putFixed64 × 4 = 32 字节，+ 8 magic = 40 ✅
+
+    s = WriteRaw(footer.data(), footer.size());
+    if (!s.ok()) return s;
+
+    // ④ fsync：保证落盘
+    if (::fsync(fd_) != 0) {
+        return Status::IOError(ErrnoMsg("fsync"));
+    }
+    finished_ = true;
+    return Status::OK();
+}
+
+// ================= Table =================
+
+Table::Table() = default;
+
+Table::~Table() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
+Status Table::ReadRange(uint64_t offset, uint64_t size, std::string* out) const {
+    out->assign(size, '\0');
+    size_t got = 0;
+    while (got < size) {
+        ssize_t r = ::pread(fd_, &(*out)[got], size - got, static_cast<off_t>(offset + got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return Status::IOError(ErrnoMsg("pread"));
+        }
+        if (r == 0) break;  // 文件比预期短
+        got += static_cast<size_t>(r);
+    }
+    if (got != size) {
+        return Status::Corruption("short read");
+    }
+    return Status::OK();
+}
+
+Status Table::ReadBlock(uint64_t offset, uint64_t size, std::string* out) const {
+    return ReadRange(offset, size, out);
+}
+
+Status Table::Open(const std::string& path, std::unique_ptr<Table>* table) {
+    std::unique_ptr<Table> t(new Table());
+    t->path_ = path;
+    t->fd_ = ::open(path.c_str(), O_RDONLY);
+    if (t->fd_ < 0) {
+        if (errno == ENOENT) return Status::NotFound("table not found: " + path);
+        return Status::IOError(ErrnoMsg(("open " + path).c_str()));
+    }
+
+    // 文件总大小
+    off_t sz = ::lseek(t->fd_, 0, SEEK_END);
+    if (sz < 0) return Status::IOError(ErrnoMsg("lseek"));
+    t->file_size_ = static_cast<uint64_t>(sz);
+
+    if (t->file_size_ < kFooterSize) {
+        return Status::Corruption("file too small to be a table");
+    }
+
+    // ① 读 footer（最后 40 字节）
+    std::string footer;
+    Status s = t->ReadRange(t->file_size_ - kFooterSize, kFooterSize, &footer);
+    if (!s.ok()) return s;
+
+    Slice f(footer);
+    uint64_t filter_offset = 0, filter_size = 0, index_offset = 0, index_size = 0;
+    if (!GetFixed64(&f, &filter_offset) || !GetFixed64(&f, &filter_size) ||
+        !GetFixed64(&f, &index_offset) || !GetFixed64(&f, &index_size)) {
+        return Status::Corruption("bad footer");
+    }
+    (void)filter_offset;
+    (void)filter_size;
+
+    // ② 校验 magic
+    if (f.size() < sizeof(kMagic) || std::memcmp(f.data(), kMagic, sizeof(kMagic)) != 0) {
+        return Status::Corruption("bad magic");
+    }
+
+    // ③ 校验 index 的位置合法
+    if (index_offset + index_size > t->file_size_ - kFooterSize) {
+        return Status::Corruption("index out of range");
+    }
+
+    // ④ 把 index 读进内存（它很小，约数据量的 0.5%）
+    s = t->ReadRange(index_offset, index_size, &t->index_data_);
+    if (!s.ok()) return s;
+
+    t->index_.reset(new Block(Slice(t->index_data_)));
+
+    *table = std::move(t);
+    return Status::OK();
+}
+
+Status Table::Get(const Slice& key, std::string* value) const {
+    // ① 在 index 里找「第一个 key >= target」的条目
+    std::string index_key;
+    std::string handle;
+    if (!index_->SeekGE(key, &index_key, &handle)) {
+        return Status::NotFound("key out of range");
+    }
+
+    // ② 解析 handle: (block_offset, block_size)
+    Slice h(handle);
+    uint32_t block_offset = 0, block_size = 0;
+    if (!GetVarint32(&h, &block_offset) || !GetVarint32(&h, &block_size)) {
+        return Status::Corruption("bad index handle");
+    }
+
+    // ③ 读那个 data block，在 block 内查找
+    std::string block_data;
+    Status s = ReadBlock(block_offset, block_size, &block_data);
+    if (!s.ok()) return s;
+
+    Block block{Slice(block_data)};
+    if (!block.Get(key, value)) {
+        return Status::NotFound("key not in block");
+    }
+    return Status::OK();
+}
+
+}  // namespace ldb

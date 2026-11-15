@@ -142,16 +142,17 @@ int Block::CompareRestartKey(uint32_t i, const Slice& target) const {
     return key_delta.Compare(target);
 }
 
-bool Block::Get(const Slice& key, std::string* value) const {
+bool Block::SeekGE(const Slice& target, std::string* out_key, std::string* out_value) const {
     if (num_restarts_ == 0) return false;
 
     // ---------- ① 在 restart 数组里二分 ----------
-    // 找「最后一个 key <= target」的 restart
+    // 找「最后一个 restart 的 key <= target」
+    // 如果所有 restart 的 key 都 > target，二分后 left 会是 0（要顺推）
     uint32_t left = 0;
     uint32_t right = num_restarts_ - 1;
     while (left < right) {
         const uint32_t mid = (left + right + 1) / 2;
-        if (CompareRestartKey(mid, key) <= 0) {
+        if (CompareRestartKey(mid, target) <= 0) {
             left = mid;
         } else {
             right = mid - 1;
@@ -159,6 +160,7 @@ bool Block::Get(const Slice& key, std::string* value) const {
     }
 
     // ---------- ② 从那个 restart 开始顺推 ----------
+    // 【注意】边界是 restart_offset_（数组区起点），不是 contents_.size()
     const uint32_t start = RestartOffset(left);
     Slice input(contents_.data() + start, restart_offset_ - start);
 
@@ -168,25 +170,28 @@ bool Block::Get(const Slice& key, std::string* value) const {
         Slice key_delta, val;
         if (!ParseEntry(&input, &shared, &key_delta, &val)) break;
 
-        // 还原完整 key（前缀 + 独有部分）
+        // 还原完整 key（前 shared 字节来自上一条 + 本条独有部分）
         std::string cur_key;
-        cur_key.resize(shared);
-        if (shared > 0) {
-            cur_key.assign(last_key.data(), shared);
-        }
+        if (shared > 0) cur_key.assign(last_key.data(), shared);
         cur_key.append(key_delta.data(), key_delta.size());
 
-        const int cmp = Slice(cur_key).Compare(key);
-        if (cmp == 0) {
-            value->assign(val.data(), val.size());
+        if (Slice(cur_key).Compare(target) >= 0) {
+            *out_key = std::move(cur_key);
+            out_value->assign(val.data(), val.size());
             return true;
-        }
-        if (cmp > 0) {
-            return false;  // 已经越过 target
         }
         last_key.swap(cur_key);
     }
     return false;
+}
+
+bool Block::Get(const Slice& key, std::string* value) const {
+    std::string found_key;
+    std::string found_value;
+    if (!SeekGE(key, &found_key, &found_value)) return false;
+    if (Slice(found_key).Compare(key) != 0) return false;
+    *value = std::move(found_value);
+    return true;
 }
 
 void Block::DumpTo(std::vector<std::pair<std::string, std::string>>* out) const {

@@ -89,10 +89,17 @@ public:
     // 构造时解析尾部的 restart 数组
     explicit Block(Slice contents);
 
-    // 查找 key
+    // 查找 key（精确匹配）
     //   找到 -> 返回 true，*value 填上
     //   没找到 -> false
     bool Get(const Slice& key, std::string* value) const;
+
+    // 查找【第一个 key >= target】的 entry
+    //   index block 用这个：它存的是「每个 data block 的最后一个 key」，
+    //   找「第一个 >= target 的索引项」就定位到了目标 block
+    //   找到 -> true，*out_key / *out_value 填上
+    //   没有（target 比所有 key 都大）-> false
+    bool SeekGE(const Slice& target, std::string* out_key, std::string* out_value) const;
 
     // 遍历：从 first_key 开始，最多拿 n 条（用于调试/测试）
     void DumpTo(std::vector<std::pair<std::string, std::string>>* out) const;
