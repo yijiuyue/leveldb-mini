@@ -30,6 +30,10 @@ foreach(t util wal memtable block bloom table db)
   target_link_libraries(test_${t} ldb)
 endforeach()
 
+# 崩溃恢复测试的被测程序（不由 ctest 驱动，由 tests/run_crash_test.sh 驱动）
+add_executable(crash_test tests/crash_test.cpp)
+target_link_libraries(crash_test ldb)
+
 enable_testing()
 foreach(t util wal memtable block bloom table db)
   add_test(NAME ${t} COMMAND test_${t})
