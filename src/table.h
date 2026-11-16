@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "bloom.h"
 #include "block.h"
 #include "slice.h"
 #include "status.h"
@@ -92,6 +94,10 @@ private:
     bool has_last_key_ = false;
     std::string pending_index_key_;  // 当前 block 的最后一个 key
 
+    // 布隆过滤器：记录每个 key 的哈希，Finish 时一次性生成位图
+    std::vector<uint32_t> key_hashes_;
+    BloomPolicy bloom_policy_;
+
     size_t num_entries_ = 0;
     size_t num_data_blocks_ = 0;
     bool finished_ = false;
@@ -129,6 +135,11 @@ private:
     // 因为 Block 的 Slice 指向 index_data_ 的内存，析构顺序反了就悬垂
     std::string index_data_;
     std::unique_ptr<Block> index_;
+
+    // 布隆过滤器（整文件一个）
+    // filter_data_ 同样必须声明在 bloom_policy_ 之前（Slice 指向它）
+    std::string filter_data_;
+    BloomPolicy bloom_policy_;
 };
 
 }  // namespace ldb

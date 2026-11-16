@@ -18,18 +18,19 @@ add_library(ldb
   src/skiplist.cpp
   src/memtable.cpp
   src/block.cpp
+  src/bloom.cpp
   src/table.cpp
   src/db.cpp
 )
 
 target_include_directories(ldb PUBLIC include src)
 
-foreach(t util wal memtable block table db)
+foreach(t util wal memtable block bloom table db)
   add_executable(test_${t} tests/test_${t}.cpp)
   target_link_libraries(test_${t} ldb)
 endforeach()
 
 enable_testing()
-foreach(t util wal memtable block table db)
+foreach(t util wal memtable block bloom table db)
   add_test(NAME ${t} COMMAND test_${t})
 endforeach()

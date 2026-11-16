@@ -72,6 +72,9 @@ Status TableBuilder::Add(const Slice& key, const Slice& value) {
     pending_index_key_ = last_key_;
     num_entries_++;
 
+    // 收集哈希，Finish 时生成布隆位图
+    key_hashes_.push_back(BloomHash(key));
+
     // block 攒到 4KB 就落盘
     if (data_block_.CurrentSizeEstimate() >= block_size_) {
         return Flush();
@@ -116,10 +119,17 @@ Status TableBuilder::Finish() {
     s = WriteRaw(index_contents.data(), index_contents.size());
     if (!s.ok()) return s;
 
-    // ③ footer（40 字节）
+    // ③ 布隆过滤器（整文件一个）
+    const std::string filter = bloom_policy_.CreateFilter(key_hashes_);
+    const uint64_t filter_offset = offset_;
+    const uint64_t filter_size = filter.size();
+    s = WriteRaw(filter.data(), filter.size());
+    if (!s.ok()) return s;
+
+    // ④ footer（40 字节）
     std::string footer;
-    PutFixed64(&footer, 0);            // filter_offset（布隆后面做，先填 0）
-    PutFixed64(&footer, 0);            // filter_size
+    PutFixed64(&footer, filter_offset);
+    PutFixed64(&footer, filter_size);
     PutFixed64(&footer, index_offset);
     PutFixed64(&footer, index_size);
     footer.append(kMagic, sizeof(kMagic));
@@ -128,7 +138,7 @@ Status TableBuilder::Finish() {
     s = WriteRaw(footer.data(), footer.size());
     if (!s.ok()) return s;
 
-    // ④ fsync：保证落盘
+    // ⑤ fsync：保证落盘
     if (::fsync(fd_) != 0) {
         return Status::IOError(ErrnoMsg("fsync"));
     }
@@ -198,20 +208,28 @@ Status Table::Open(const std::string& path, std::unique_ptr<Table>* table) {
         !GetFixed64(&f, &index_offset) || !GetFixed64(&f, &index_size)) {
         return Status::Corruption("bad footer");
     }
-    (void)filter_offset;
-    (void)filter_size;
+
 
     // ② 校验 magic
     if (f.size() < sizeof(kMagic) || std::memcmp(f.data(), kMagic, sizeof(kMagic)) != 0) {
         return Status::Corruption("bad magic");
     }
 
-    // ③ 校验 index 的位置合法
+    // ③ 读布隆过滤器（filter_size == 0 表示没有，兼容旧文件）
+    if (filter_size > 0) {
+        if (filter_offset + filter_size > t->file_size_ - kFooterSize) {
+            return Status::Corruption("filter out of range");
+        }
+        s = t->ReadRange(filter_offset, filter_size, &t->filter_data_);
+        if (!s.ok()) return s;
+    }
+
+    // ④ 校验 index 的位置合法
     if (index_offset + index_size > t->file_size_ - kFooterSize) {
         return Status::Corruption("index out of range");
     }
 
-    // ④ 把 index 读进内存（它很小，约数据量的 0.5%）
+    // ⑤ 把 index 读进内存（它很小，约数据量的 0.5%）
     s = t->ReadRange(index_offset, index_size, &t->index_data_);
     if (!s.ok()) return s;
 
@@ -222,6 +240,15 @@ Status Table::Open(const std::string& path, std::unique_ptr<Table>* table) {
 }
 
 Status Table::Get(const Slice& key, std::string* value) const {
+    // ⓪ 布隆过滤器：如果【一定不在】，直接返回，省掉 pread
+    //
+    // 【为什么这个判断可信】
+    //   布隆过滤器没有假阴性 —— 存在的 key 一定返回 true
+    //   所以返回 false 时「一定不在」是确定的
+    if (!filter_data_.empty() && !bloom_policy_.MayContain(Slice(filter_data_), key)) {
+        return Status::NotFound("bloom filter: definitely not in this file");
+    }
+
     // ① 在 index 里找「第一个 key >= target」的条目
     std::string index_key;
     std::string handle;
