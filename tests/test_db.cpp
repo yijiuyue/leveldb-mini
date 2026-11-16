@@ -212,6 +212,78 @@ void TestManySSTables() {
     }
 }
 
+// ---------------- ⑧ 【回归测试】打开后不写就关闭，数据不能丢 ----------------
+//
+// 这是修复的 bug：
+//   旧实现：重放 WAL -> 立刻开新 WAL（空）-> 保留旧 WAL
+//   此时崩溃 -> 重启只重放新 WAL（空）-> 数据全丢
+//
+// 新实现：重放 WAL -> 立刻落盘成 SSTable -> 删旧 WAL -> 开新 WAL
+//   -> 任何时刻崩溃，数据要么在 SSTable，要么在唯一的 WAL
+
+void TestReopenWithoutWrite() {
+    std::printf("[8] 打开后不写就关闭（回归测试）\n");
+    CleanDir();
+
+    // ① 写 100 条（不 flush，数据只在 WAL + MemTable）
+    {
+        auto db = Open();
+        for (int i = 0; i < 100; i++) {
+            CHECK(db->Put(Slice(Key(i)), Slice(Val(i)), true).ok());
+        }
+    }
+
+    // ② 打开（触发重放），什么都不写就关闭
+    {
+        auto db = Open();
+        std::string v;
+        CHECK(db->Get(Slice(Key(0)), &v).ok());
+    }
+
+    // ③ 再打开：数据必须还在（旧实现这里会丢）
+    {
+        auto db = Open();
+        std::string v;
+        int ok = 0;
+        for (int i = 0; i < 100; i++) {
+            if (db->Get(Slice(Key(i)), &v).ok() && v == Val(i)) ok++;
+        }
+        CHECK(ok == 100);
+        if (ok == 100) {
+            std::printf("       连续 Open 3 次，100 条一条不丢 OK\n");
+        }
+    }
+}
+
+// ---------------- ⑨ 【回归测试】多次 flush 后残留多个 log 也能恢复 ----------------
+
+void TestMultipleLogs() {
+    std::printf("[9] 多个残留 log 全部重放\n");
+    CleanDir();
+
+    {
+        auto db = Open(4 * 1024);   // 小阈值，频繁 flush
+        for (int i = 0; i < 300; i++) {
+            CHECK(db->Put(Slice(Key(i)), Slice(Val(i))).ok());
+        }
+        std::printf("       300 条 -> %zu 个 SSTable\n", db->NumSSTables());
+    }
+
+    // 连续开三次（每次都重放 + 落盘 + 删旧 WAL）
+    for (int round = 0; round < 3; round++) {
+        auto db = Open(4 * 1024);
+        std::string v;
+        int ok = 0;
+        for (int i = 0; i < 300; i++) {
+            if (db->Get(Slice(Key(i)), &v).ok() && v == Val(i)) ok++;
+        }
+        CHECK(ok == 300);
+        if (ok != 300) {
+            std::printf("       第 %d 次 Open 后只读到 %d / 300 条\n", round + 1, ok);
+        }
+    }
+    std::printf("       连续 Open 3 次，300 条一条不丢 OK\n");
+}
 int main() {
     TestBasic();
     TestRecovery();
@@ -220,6 +292,8 @@ int main() {
     TestOverwrite();
     TestDeleteThenRewrite();
     TestManySSTables();
+    TestReopenWithoutWrite();
+    TestMultipleLogs();
 
     std::printf("\n%d / %d passed", g_total - g_failed, g_total);
     if (g_failed == 0) {

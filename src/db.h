@@ -81,6 +81,10 @@ private:
     Status Recover();       // 扫目录 + 重放 WAL
     Status FlushMemTable(); // 把 MemTable 写成 SSTable，换新 WAL
 
+    // 只做「MemTable -> SSTable」这一步（不碰 WAL、不清空 MemTable）
+    // 拆出来是为了让 Recover 能「先落盘再删旧 WAL」，避免数据丢失窗口
+    Status WriteMemTableToSSTable();
+
     std::string dir_;
     Options opt_;
 

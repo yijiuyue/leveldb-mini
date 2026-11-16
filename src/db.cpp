@@ -114,27 +114,32 @@ Status DB::Recover() {
     std::sort(sst_files_.begin(), sst_files_.end());
     std::sort(log_files.begin(), log_files.end());
 
-    // ---------- ② 重放 WAL（崩溃恢复） ----------
-    mem_.reset(new MemTable());
-    int recovered = 0;
+    next_file_number_ = max_number + 1;
 
-    if (!log_files.empty()) {
-        // 用编号最大的那个 log（正常情况只有一个）
-        const std::string& wal_path = log_files.back();
+    // ---------- ② 重放【所有】log（升序，幂等） ----------
+    //
+    // 【为什么重放全部，不只最新的】
+    //   正常情况只有一个 log（每次 flush 都删旧的）。
+    //   但如果有残留（删失败/崩溃），只重放最新的会漏数据。
+    //   重放全部是安全的：put 是覆盖写、delete 是覆盖墓碑，重放两次结果一样。
+    //   顺序必须升序（老的先、新的后），这样最后的状态才正确。
+    mem_.reset(new MemTable());
+
+    for (const auto& wal_path : log_files) {
         wal::Reader reader;
         Status s = reader.Open(wal_path);
-        if (!s.ok() && !s.IsNotFound()) return s;
+        if (!s.ok()) continue;   // 打不开就跳过这个 log
 
         std::string rec;
         while (true) {
             s = reader.ReadRecord(&rec);
-            if (s.IsNotFound()) break;          // 正常读完
+            if (s.IsNotFound()) break;       // 正常读完
             if (s.IsCorruption()) {
                 // 【静默截断】崩溃时最后一条可能只写了一半
-                // 前面恢复出来的都是好的，后面的都不可信 → 停
+                // 前面恢复出来的都可信，后面不知道在哪 → 停
                 break;
             }
-            if (!s.ok()) return s;
+            if (!s.ok()) break;              // IO 错误也停（这条 log 不可信）
 
             RecordType type;
             std::string key, value;
@@ -145,32 +150,37 @@ Status DB::Recover() {
             } else if (type == kRecDelete) {
                 mem_->Delete(key);
             }
-            recovered++;
         }
         reader.Close();
     }
 
-    // ---------- ③ 删掉陈旧的 WAL（数据已在 SSTable 里） ----------
-    // 保留编号最大的那个（上面已重放），其余全删
-    for (size_t i = 0; i + 1 < log_files.size(); i++) {
-        std::error_code ec2;
-        fs::remove(log_files[i], ec2);
+    // ---------- ③ 恢复出的数据【立刻落盘】 ----------
+    //
+    // 【为什么必须现在就落盘】
+    //   如果不落盘就直接删旧 WAL：
+    //     重放 -> MemTable 有数据 -> 删旧 WAL -> 开新 WAL（空）
+    //     此时崩溃 -> 重启只重放新 WAL（空）-> 数据全丢
+    //
+    //   先落盘就保证了不变式：
+    //     「任何时刻，数据要么在 SSTable 里，要么在唯一的 WAL 里」
+    Status s = WriteMemTableToSSTable();
+    if (!s.ok()) return s;
+    mem_.reset(new MemTable());
+
+    // ---------- ④ 现在可以安全删除所有旧 WAL ----------
+    for (const auto& p : log_files) {
+        std::error_code ec_rm;
+        fs::remove(p, ec_rm);
     }
 
-    // ---------- ④ 打开新 WAL（编号 = max + 1） ----------
-    next_file_number_ = max_number + 1;
+    // ---------- ⑤ 开新 WAL（空的） ----------
     wal_path_ = FileName(dir_, next_file_number_, ".log");
     next_file_number_++;
 
     wal_.reset(new wal::Writer());
-    Status s = wal_->Open(wal_path_);
+    s = wal_->Open(wal_path_);
     if (!s.ok()) return s;
 
-    // 恢复出来的数据如果已经超过阈值，落盘
-    if (mem_->ApproximateMemoryUsage() >= opt_.write_buffer_size) {
-        return FlushMemTable();
-    }
-    (void)recovered;
     return Status::OK();
 }
 
@@ -265,10 +275,10 @@ Status DB::Flush() {
     return FlushMemTable();
 }
 
-Status DB::FlushMemTable() {
+Status DB::WriteMemTableToSSTable() {
     if (mem_->size() == 0) return Status::OK();
 
-    // ① 写新 SSTable
+    // ① 生成文件名并落盘
     const std::string sst_path = FileName(dir_, next_file_number_, ".sst");
     next_file_number_++;
 
@@ -281,11 +291,21 @@ Status DB::FlushMemTable() {
     });
     if (!s.ok()) return s;
 
-    s = builder.Finish();
+    s = builder.Finish();   // 里面含 fsync
     if (!s.ok()) return s;
 
+    // ② 登记到文件列表（Get 时按此顺序查找）
     sst_files_.push_back(sst_path);
     std::sort(sst_files_.begin(), sst_files_.end());
+    return Status::OK();
+}
+
+Status DB::FlushMemTable() {
+    if (mem_->size() == 0) return Status::OK();
+
+    // ① 先落盘
+    Status s = WriteMemTableToSSTable();
+    if (!s.ok()) return s;
 
     // ② 清空 MemTable
     mem_.reset(new MemTable());
@@ -295,8 +315,8 @@ Status DB::FlushMemTable() {
         wal_->Close();
         wal_.reset();
         if (!wal_path_.empty()) {
-            std::error_code ec3;
-            fs::remove(wal_path_, ec3);   // 删掉旧 WAL
+            std::error_code ec_rm;
+            fs::remove(wal_path_, ec_rm);
         }
     }
     wal_path_ = FileName(dir_, next_file_number_, ".log");
