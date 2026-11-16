@@ -245,15 +245,26 @@ Status DB::Get(const Slice& key, std::string* value) {
     }
 
     // ② 按【新的优先】查 SSTable
+    //
+    // 【错误处理原则】
+    //   NotFound  = 「这个文件里没有」→ 正常，继续查更老的
+    //   Corruption / IOError = 「文件坏了 / 读不了」→ 【必须上报，不能静默跳过】
+    //
+    //   为什么不能跳过：坏文件里的数据【不可信】，跳过它去读更老的文件，
+    //   可能返回一个【过期的旧值】——比直接报错更危险。
+    //   （这是我自己 review 时发现的 bug，原来两处都是 continue。）
     for (auto it = sst_files_.rbegin(); it != sst_files_.rend(); ++it) {
         std::unique_ptr<Table> table;
         Status s = Table::Open(*it, &table);
-        if (!s.ok()) continue;  // 坏文件跳过（真实实现应该报错）
+        if (!s.ok()) {
+            if (s.IsNotFound()) continue;  // 文件被外部删了 -> 跳过
+            return s;                      // footer 坏 / magic 不对 -> 上报
+        }
 
         std::string encoded;
         s = table->Get(key, &encoded);
-        if (s.IsNotFound()) continue;  // 这个文件没有，查更老的
-        if (!s.ok()) continue;
+        if (s.IsNotFound()) continue;      // 这个文件里没有 -> 查更老的
+        if (!s.ok()) return s;             // 索引坏 / 读盘失败 -> 上报
 
         // 解码 type
         const unsigned char type = static_cast<unsigned char>(encoded[0]);

@@ -284,6 +284,65 @@ void TestMultipleLogs() {
     }
     std::printf("       连续 Open 3 次，300 条一条不丢 OK\n");
 }
+// ---------------- ⑩ 【回归测试】坏 SSTable 必须上报，不能静默跳过 ----------------
+//
+// 旧实现：Get 里遇到 Table::Open 失败 / Table::Get 失败，都是 continue
+//   -> 坏文件里的数据被「悄悄跳过」，可能返回更老的【过期旧值】
+//   -> 表现为「数据静默倒退」，比直接报错更危险
+//
+// 新实现：只有 NotFound 才 continue；Corruption / IOError 一律上报
+
+void TestCorruptSSTableReports() {
+    std::printf("[10] 坏 SSTable 必须上报 Corruption\n");
+    CleanDir();
+
+    // ① 写数据并落盘
+    {
+        auto db = Open();
+        for (int i = 0; i < 50; i++) {
+            CHECK(db->Put(Slice(Key(i)), Slice(Val(i)), true).ok());
+        }
+        CHECK(db->Flush().ok());
+        CHECK(db->NumSSTables() == 1);
+    }
+
+    // ② 找到那个 .sst，破坏它的 magic（最后一个字节）
+    {
+        std::string sst_path;
+        for (const auto& e : fs::directory_iterator(kDir)) {
+            if (e.path().extension() == ".sst") sst_path = e.path().string();
+        }
+        CHECK(!sst_path.empty());
+
+        FILE* f = std::fopen(sst_path.c_str(), "r+b");
+        CHECK(f != nullptr);
+        std::fseek(f, 0, SEEK_END);
+        const long sz = std::ftell(f);
+        std::fseek(f, sz - 1, SEEK_SET);
+        unsigned char c = 0;
+        std::fread(&c, 1, 1, f);
+        c ^= 0xFF;
+        std::fseek(f, sz - 1, SEEK_SET);
+        std::fwrite(&c, 1, 1, f);
+        std::fclose(f);
+        std::printf("       已破坏 %s 的 magic\n", sst_path.c_str());
+    }
+
+    // ③ 重新打开：Get 一个【该文件里存在】的 key，必须返回 Corruption
+    {
+        auto db = Open();
+        std::string v;
+        Status s = db->Get(Slice(Key(7)), &v);
+        CHECK(!s.ok());
+        CHECK(s.IsCorruption());
+        if (s.IsCorruption()) {
+            std::printf("       Get 返回 Corruption（正确，不再静默跳过）\n");
+        } else {
+            std::printf("       Get 返回 %s（错误！应该是 Corruption）\n",
+                        s.ToString().c_str());
+        }
+    }
+}
 int main() {
     TestBasic();
     TestRecovery();
@@ -294,6 +353,7 @@ int main() {
     TestManySSTables();
     TestReopenWithoutWrite();
     TestMultipleLogs();
+    TestCorruptSSTableReports();
 
     std::printf("\n%d / %d passed", g_total - g_failed, g_total);
     if (g_failed == 0) {
