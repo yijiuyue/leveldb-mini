@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <string>
 
 #include "util/coding.h"
 
@@ -18,6 +19,28 @@ constexpr size_t kFooterSize = 40;  // 4 × 8 偏移 + 8 magic
 
 std::string ErrnoMsg(const char* what) {
     return std::string(what) + ": " + std::strerror(errno);
+}
+
+// 取路径的目录部分（"a/b/c.sst" -> "a/b"，"c.sst" -> "."）
+std::string DirOf(const std::string& path) {
+    const size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return path.substr(0, pos);
+}
+
+// fsync 一个目录，让「新建文件的目录项」落盘
+//
+// 【为什么需要】新文件的 dentry 和 inode 都在内核缓存里，
+// 只 fsync 文件内容，断电后文件名可能不存在（ENOENT）。
+bool SyncDir(const std::string& dir) {
+    const int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0) return false;
+    const int rc = ::fsync(dirfd);
+    const int saved = errno;
+    ::close(dirfd);
+    errno = saved;
+    return rc == 0;
 }
 
 }  // namespace
@@ -138,10 +161,30 @@ Status TableBuilder::Finish() {
     s = WriteRaw(footer.data(), footer.size());
     if (!s.ok()) return s;
 
-    // ⑤ fsync：保证落盘
+    // ⑤ fsync 文件内容
+    //
+    // 【只有 fsync 返回，数据才算真正落盘】
+    //   write()  → 进 OS 页缓存
+    //   close()  → 只是释放 fd，不保证刷盘
+    //   fsync()  → 才保证落到物理磁盘
     if (::fsync(fd_) != 0) {
         return Status::IOError(ErrnoMsg("fsync"));
     }
+
+    // ⑥ fsync 目录项
+    //
+    // 【为什么文件内容 fsync 了还不够】
+    //   open(path, O_CREAT) 会在内核里创建【目录项（dentry）】和 inode，
+    //   目录项本身也是页缓存里的数据。
+    //   只 fsync 文件 fd，保证的是「文件内容」落盘，
+    //   但「这个文件名存在」这件事可能还在缓存里。
+    //   → 断电重启后 open("xxx.sst") 可能返回 ENOENT，文件「消失」。
+    //
+    //   所以对【新建的文件】必须再 fsync 它所在的目录。
+    if (!SyncDir(DirOf(path_))) {
+        return Status::IOError(ErrnoMsg("fsync dir"));
+    }
+
     finished_ = true;
     return Status::OK();
 }

@@ -1,0 +1,24 @@
+fix: 新建 SSTable 后 fsync 目录项（断电后文件不丢）
+
+【问题】
+Finish() 只 fsync 了文件内容，没有 fsync 目录项。
+新建文件的 dentry 和 inode 都在内核页缓存里，只 fsync 文件 fd 保证
+「内容」落盘，但「文件名存在」这件事可能还在缓存。
+→ 断电重启后 open(xxx.sst) 可能返回 ENOENT，文件「消失」。
+
+【修法】
+Finish() 末尾追加 open(dir, O_DIRECTORY) + fsync(dirfd)。
+新增 DirOf()（取路径的目录部分）和 SyncDir()（fsync 目录）。
+
+【实测】
+strace -e trace=fsync 显示：
+  fsync(4) = 0    <- 文件内容（000002.sst）
+  fsync(5) = 0    <- 目录项（新加）
+
+【补全后的 fsync 语义】
+从 Put 到 FlushMemTable 结束共 3 次：
+  1. WAL fsync（sync=true 时，每条）-> 保护这一条记录
+  2. SSTable fsync -> 保护整个文件内容
+  3. 目录 fsync -> 保护「文件名存在」这件事
+
+测试 14081 项全过
